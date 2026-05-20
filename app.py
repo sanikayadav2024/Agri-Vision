@@ -13,19 +13,19 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from dotenv import load_dotenv
-from flasgger import Swagger  # Swager yahan add kiya hai
+from flasgger import Swagger
 from flask import Flask, flash, jsonify, redirect, render_template, request, url_for
 from jinja2 import Environment, FileSystemLoader
 from PIL import Image
 from torchvision import transforms
 from ultralytics import YOLO
-
 from werkzeug.utils import secure_filename
 
-import json
-from jinja2 import Environment, FileSystemLoader
-from services.weather_service import get_weather, geocode_city, generate_weather_recommendations
-
+from services.weather_service import (
+    generate_weather_recommendations,
+    geocode_city,
+    get_weather,
+)
 
 load_dotenv()
 
@@ -33,12 +33,11 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__, static_folder="static", template_folder="templates")
-swagger = Swagger(app)  # Swagger yahan initialize kiya hai
+swagger = Swagger(app)
 
 app.config["TEMPLATES_AUTO_RELOAD"] = True
 app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0
 
-# Keep Flask's own Jinja environment so template globals like url_for and get_flashed_messages remain available
 app.jinja_env.auto_reload = True
 app.jinja_env.cache = {}
 
@@ -54,7 +53,6 @@ LANG = {
     "te": {"welcome": "అగ్రి విజన్‌కు స్వాగతం"},
 }
 
-# Setup directories (safe repeat)
 os.makedirs("static/uploads", exist_ok=True)
 os.makedirs("static/css", exist_ok=True)
 os.makedirs("models", exist_ok=True)
@@ -64,25 +62,23 @@ MAX_INFERENCE_DIMENSION = 1024
 DISPLAY_IMAGE_MAX_DIMENSION = 1200
 DISPLAY_JPEG_QUALITY = 80
 
-# --- Class Names ---
-# --- Disease class list (from confusion matrix order) ---
 disease_classes = [
-    "Aphids",  # 0
-    "Army worm",  # 1
-    "Bacterial blight",  # 2
-    "Cotton Boll Rot",  # 3
-    "Green Cotton Boll",  # 4
-    "Healthy",  # 5
-    "Powdery mildew",  # 6
-    "Target Spot",  # 7
+    "Aphids",
+    "Army worm",
+    "Bacterial blight",
+    "Cotton Boll Rot",
+    "Green Cotton Boll",
+    "Healthy",
+    "Powdery mildew",
+    "Target Spot",
 ]
-# --- Growth stage class list (from data.yaml for YOLOv8) ---
+
 growth_stage_classes = [
-    "Cotton Blossom",  # 0
-    "Cotton Bud",  # 1
-    "Early Boll",  # 2
-    "Matured Cotton Boll",  # 3
-    "Split Cotton Boll",  # 4
+    "Cotton Blossom",
+    "Cotton Bud",
+    "Early Boll",
+    "Matured Cotton Boll",
+    "Split Cotton Boll",
 ]
 
 resnet_model = None
@@ -125,26 +121,22 @@ def preprocess_image_for_resnet(image, target_size=(224, 224)):
 
 
 def infer_disease(image):
-    # Returns all disease outputs, including confidences for each class
     if resnet_model:
         processed = preprocess_image_for_resnet(image)
         with torch.no_grad():
             output = resnet_model(processed)
             probs = F.softmax(output, dim=1)
             confidence, prediction = torch.max(probs, 1)
-        probs_np = probs.numpy()  # shape: (1, 8)
+        probs_np = probs.numpy()
         class_idx = int(prediction.item())
         healthy_idx = disease_classes.index("Healthy")
         health_score = float(probs_np[0][healthy_idx]) * 100
-
     else:
-        # Demo fallback
         probs_np = np.random.rand(1, len(disease_classes))
         probs_np = probs_np / probs_np.sum(axis=1, keepdims=True)
         class_idx = int(np.argmax(probs_np[0]))
         health_score = float(np.max(probs_np[0])) * 100
 
-    # Format probabilities per class
     disease_confidences = {
         disease_classes[i]: float(probs_np[0][i]) for i in range(len(disease_classes))
     }
@@ -154,7 +146,7 @@ def infer_disease(image):
         "predicted_class_idx": class_idx,
         "confidence": float(probs_np[0][class_idx]),
         "all_confidences": disease_confidences,
-        "health_score": health_score,  # 0-100
+        "health_score": health_score,
         "raw": probs_np.tolist(),
     }
     return results
@@ -193,12 +185,11 @@ def infer_growth_stage(image):
                             if class_id < len(growth_stage_classes)
                             else str(class_id),
                             "confidence": conf,
-                            "bbox": xyxy,  # [x1, y1, x2, y2]
+                            "bbox": xyxy,
                         }
                     )
             else:
                 continue
-        # Most confident box as main prediction
         if len(boxes):
             main = max(boxes, key=lambda x: x["confidence"])
             result.update(
@@ -213,13 +204,8 @@ def infer_growth_stage(image):
     return result
 
 
-
-def generate_recommendations(disease_result, growth_result):
-
 def generate_recommendations(disease_result, growth_result, weather=None):
-
     recs = []
- 
     dclass = disease_result["predicted_class"]
     instr_map = {
         "Aphids": [
@@ -256,12 +242,12 @@ def generate_recommendations(disease_result, growth_result, weather=None):
         ],
     }
     recs.extend(instr_map.get(dclass, ["Practice general crop hygiene."]))
- 
+
     if disease_result["health_score"] < 50:
         recs.append("Consult an agricultural expert urgently for low health score.")
     elif disease_result["health_score"] < 70:
         recs.append("Increase frequency of crop monitoring based on moderate health.")
- 
+
     gmain = growth_result.get("main_class", None)
     grow_map = {
         "Cotton Blossom": [
@@ -285,17 +271,12 @@ def generate_recommendations(disease_result, growth_result, weather=None):
     if gmain in grow_map:
         recs.extend(grow_map[gmain])
 
-    # Recommend only top 5 relevant
-    return recs[:5]
-
-
- 
-    # ── NEW: inject weather-aware recommendations ──
     if weather:
         weather_recs = generate_weather_recommendations(weather)
         recs.extend(weather_recs)
- 
-    return recs[:6]  # increased cap slightly to accommodate weather tips
+
+    return recs[:6]
+
 
 def resize_image(image, max_dim=MAX_INFERENCE_DIMENSION):
     height, width = image.shape[:2]
@@ -307,14 +288,8 @@ def resize_image(image, max_dim=MAX_INFERENCE_DIMENSION):
 
 
 def analyze_image(image):
-    # First detect cotton growth stage
     growth = infer_growth_stage(image)
-
-    # Continue disease analysis even when crop growth stage is not confidently found.
-    # This makes deployed sites more resilient when YOLO detection is unavailable or misses an image.
     disease = infer_disease(image)
-
-    # Generate recommendations
     recs = generate_recommendations(disease, growth)
 
     result = {
@@ -339,7 +314,6 @@ def analyze_image(image):
     return result
 
 
-# UTILITY: For image bounding box rendering in the frontend, also supply dimensions
 def encode_image_for_display(image):
     import base64
 
@@ -477,7 +451,6 @@ def analyze():
             image_b64 = encode_image_for_display(image)
             results = analyze_image(compressed_rgb)
 
-            # ── Weather enrichment ──
             lat = request.form.get("lat", type=float)
             lon = request.form.get("lon", type=float)
             city = request.form.get("city", type=str)
@@ -492,15 +465,13 @@ def analyze():
                     weather = get_weather(geo["lat"], geo["lon"], owm_key)
             if weather and results.get("disease") and results.get("growth"):
                 extra_recs = generate_weather_recommendations(weather)
-                results["recommendations"] = (results.get("recommendations", []) + extra_recs)[:6]
+                results["recommendations"] = (
+                    results.get("recommendations", []) + extra_recs
+                )[:6]
                 results["weather"] = weather
 
             if results.get("error"):
                 raise ValueError(results["error"])
-
-
-
-            # Render UI, pass bounding boxes for JS drawing, raw json, etc
 
             return render_template(
                 "results.html",
@@ -509,12 +480,8 @@ def analyze():
                 image_b64=image_b64,
                 img_shape={"width": image.shape[1], "height": image.shape[0]},
                 raw_json=json.dumps(results, indent=2),
-
                 timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-
-                timestamp=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                 weather=weather,
-
             )
         except Exception as e:
             logger.error(f"Analysis error: {e}")
@@ -616,7 +583,6 @@ def comparison():
 
 @app.route("/demo")
 def demo():
-    # Generate demo outputs covering all class types
     example_disease_probs = [0.08, 0.02, 0.01, 0.10, 0.04, 0.65, 0.05, 0.05]
     demo_disease = {
         "predicted_class": "Healthy",
@@ -769,40 +735,54 @@ def stories():
     return render_template("stories.html")
 
 
-if __name__ == "__main__":
-
 @app.route("/api/weather")
 def api_weather():
     """
-    GET /api/weather?lat=28.6&lon=77.2
-    GET /api/weather?city=Delhi
-    Returns current weather data for a location.
+    Get current weather data for a location.
+    ---
+    tags:
+      - API
+    parameters:
+      - name: lat
+        in: query
+        type: number
+        required: false
+      - name: lon
+        in: query
+        type: number
+        required: false
+      - name: city
+        in: query
+        type: string
+        required: false
+    responses:
+      200:
+        description: Weather data retrieved successfully
     """
     lat = request.args.get("lat", type=float)
     lon = request.args.get("lon", type=float)
     city = request.args.get("city", type=str)
- 
+
     if city and not (lat and lon):
         geo = geocode_city(city)
         if not geo:
             return jsonify({"error": f"Could not geocode city: {city}"}), 404
         lat, lon = geo["lat"], geo["lon"]
- 
+
     if lat is None or lon is None:
         return jsonify({"error": "Provide lat & lon, or city"}), 400
- 
+
     owm_key = os.getenv("OPENWEATHER_API_KEY")
     weather = get_weather(lat, lon, owm_key)
- 
+
     if not weather:
         return jsonify({"error": "Weather data unavailable"}), 503
- 
+
     weather["weather_recommendations"] = generate_weather_recommendations(weather)
     return jsonify({"status": "success", "weather": weather})
- 
 
-if __name__ == '__main__':
 
+if __name__ == "__main__":
     logger.info("=" * 60)
     logger.info("Agri-Vision Cotton Analysis System")
     logger.info("=" * 60)
