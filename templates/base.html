@@ -18,15 +18,39 @@
     <script src="{{ url_for('static', filename='js/i18n.js') }}" defer></script>
 </head>
 <body>
-    <header>
-        <h1>Agri-Vision</h1>
-        <select id="lang-selector">
-            <option value="en" data-i18n="lang_en">English</option>
-            <option value="hi" data-i18n="lang_hi">हिन्दी</option>
-            <option value="te" data-i18n="lang_te">తెలుగు</option>
-        </select>
-        <hr/>
-    </header>
+    <!-- Professional Print Frame (Only visible in print) -->
+    <div class="print-frame no-print"></div>
+
+    <!-- Navigation -->
+    <nav class="navbar" id="navbar">
+        <div class="nav-container">
+            <a href="/" class="nav-brand">
+                <i class="fas fa-seedling"></i>
+                <span>Agri-Vision</span>
+            </a>
+            <ul class="nav-menu">
+                <li><a href="/" data-i18n="nav_home">Home</a></li>
+                <li><a href="/analyze" data-i18n="nav_analyze">Analyze</a></li>
+                <li><a href="/comparison" data-i18n="nav_comparison">Field Comparison</a></li>
+                <li><a href="/demo" data-i18n="nav_demo">Demo</a></li>
+                <li><a href="/tutorials" data-i18n="nav_tutorials">Tutorials</a></li>
+                <li><a href="/stories" data-i18n="nav_stories">Stories</a></li>
+                <li>
+                    <select id="lang-selector" style="background:transparent; border:none; color:inherit; cursor:pointer;">
+                        <option value="en" data-i18n="lang_en">English</option>
+                        <option value="hi" data-i18n="lang_hi">हिन्दी</option>
+                        <option value="te" data-i18n="lang_te">తెలుగు</option>
+                    </select>
+                </li>
+                <li>
+                    <button id="theme-toggle" class="theme-toggle-btn" aria-label="Toggle dark mode">
+                        <i class="fas fa-moon"></i>
+                    </button>
+                </li>
+                <li><a href="/analyze" class="btn btn-primary" data-i18n="nav_get_started">Get Started</a></li>
+            </ul>
+        </div>
+    </nav>
     <main>
         {% with messages = get_flashed_messages(with_categories=true) %}
         {% if messages %}
