@@ -94,6 +94,7 @@ def load_models():
             resnet_model = torch.load(
                 "models/cotton_crop_disease_classification/full_resnet50_model.pth",
                 map_location=torch.device("cpu"),
+                weights_only=False,
             )
             resnet_model.eval() # Set to eval mode immediately after loading
             logger.info("ResNet50 model loaded successfully")
@@ -565,17 +566,17 @@ def analyze_image(image):
 
     recs = generate_recommendations(disease, growth)
     
-    # Calculate severity (was missing)
+    # Calculate severity
     severity = calculate_disease_severity(disease["health_score"])
     
-    # Calculate yield prediction (was missing)
-    growth_stage = growth.get("main_class", "Unknown")
-    y_pred = predict_yield(disease["health_score"], growth_stage)
+    # Use estimate_yield from service
+    from services.yield_service import estimate_yield
+    yield_est = estimate_yield(disease, growth, weather=None, field_acres=1.0)
     
-    # Generate advanced recommendations (was missing)
+    # Generate advanced recommendations
     adv_recs = generate_advanced_recommendations(disease, growth)
     
-    # Generate farmer insights (was missing)
+    # Generate farmer insights
     insights = generate_farmer_insights(disease, growth)
 
     result = {
@@ -584,7 +585,7 @@ def analyze_image(image):
         "recommendations": recs,
         "grad_cam_image_b64": grad_cam_image_b64, # Add Grad-CAM to results
         "disease_severity": severity,
-        "yield_prediction": y_pred,
+        "yield_estimate": yield_est, # Rename to yield_estimate for template compatibility
         "advanced_recommendations": adv_recs,
         "farmer_insights": insights
     }
@@ -960,11 +961,28 @@ def demo():
     # Set top-level and nested properties for robustness
     demo_disease["heatmap_b64"] = grad_cam_image_b64
     
+    # Calculate Severity
+    severity = calculate_disease_severity(demo_disease["health_score"])
+    
+    # Use estimate_yield from service
+    from services.yield_service import estimate_yield
+    yield_est = estimate_yield(demo_disease, demo_growth, weather=None, field_acres=1.0)
+    
+    # Generate advanced recommendations
+    adv_recs = generate_advanced_recommendations(demo_disease, demo_growth)
+    
+    # Generate farmer insights
+    insights = generate_farmer_insights(demo_disease, demo_growth)
+
     example_json = {
         "disease": demo_disease,
         "growth": demo_growth,
         "recommendations": generate_recommendations(demo_disease, demo_growth),
         "grad_cam_image_b64": grad_cam_image_b64,
+        "disease_severity": severity,
+        "yield_estimate": yield_est,
+        "advanced_recommendations": adv_recs,
+        "farmer_insights": insights
     }
     return render_template(
         "results.html",
@@ -975,6 +993,7 @@ def demo():
         raw_json=json.dumps(example_json, indent=2),
         timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         grad_cam_image_b64=grad_cam_image_b64,
+        yield_estimate=yield_est # Also pass as top-level for robustness
     )
 
 
