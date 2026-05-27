@@ -4742,3 +4742,9 @@ button:disabled {
     border-color: rgba(60, 179, 113, 0.15);
     color: rgba(224, 224, 224, 0.8);
 }
+
+
+/* i18n Language Selector */
+.lang-selector-container { display: flex; align-items: center; gap: 8px; margin-left: 10px; }
+.lang-selector { padding: 4px 8px; border-radius: 4px; border: 1px solid var(--border-color, #ccc); background: var(--bg-card, #fff); color: var(--text-color, #333); font-family: inherit; font-size: 0.9em; cursor: pointer; }
+.lang-selector:focus { outline: 2px solid var(--emerald-green, #2e8b57); }

@@ -13,9 +13,16 @@
                 if (localTheme === 'dark' || (!localTheme && sysTheme)) {
                     document.documentElement.setAttribute('data-theme', 'dark');
                 }
+                
+                // SSR-safe inline initialization for language
+                var localLang = localStorage.getItem('i18n_lang');
+                if (localLang) {
+                    document.documentElement.lang = localLang;
+                }
             } catch (e) {}
         })();
     </script>
+    <script src="{{ url_for('static', filename='js/i18n.js') }}" defer></script>
     <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
     <!-- PDF.js for PDF to Image conversion -->
@@ -300,22 +307,38 @@
                 <span>Agri-Vision</span>
             </a>
             <ul class="nav-menu">
-                <li><a href="/">Home</a></li>
-                <li><a href="/analyze">Analyze</a></li>
-                <li><a href="/batch" style="font-weight: bold; color: #667eea;">📦 Batch</a></li>
-                <li><a href="/comparison">Field Comparison</a></li>
+                <li><a href="/" data-i18n="navbar.home">Home</a></li>
+                <li><a href="/analyze" data-i18n="navbar.analyze">Analyze</a></li>
+                <li><a href="/batch" style="font-weight: bold; color: #667eea;" data-i18n="navbar.batch">📦 Batch</a></li>
+                <li><a href="/comparison" data-i18n="navbar.comparison">Field Comparison</a></li>
 
-                <li><a href="/demo">Demo</a></li>
-                <li><a href="/tutorials">Tutorials</a></li>
-                <li><a href="/stories">Stories</a></li>
-                <li><a href="/history">History</a></li>
-                <li><a href="/model-admin" style="font-weight: bold; color: #667eea;">🤖 Admin</a></li>
+                <li><a href="/demo" data-i18n="navbar.demo">Demo</a></li>
+                <li><a href="/tutorials" data-i18n="navbar.tutorials">Tutorials</a></li>
+                <li><a href="/stories" data-i18n="navbar.stories">Stories</a></li>
+                <li><a href="/history" data-i18n="navbar.history">History</a></li>
+                <li><a href="/model-admin" style="font-weight: bold; color: #667eea;" data-i18n="navbar.admin">🤖 Admin</a></li>
+                
+                <li>
+                    <div class="lang-selector-container">
+                        <i class="fas fa-globe" style="color: var(--text-color, #333);"></i>
+                        <select id="lang-selector" class="lang-selector" aria-label="Select Language">
+                            <option value="en">English</option>
+                            <option value="hi">हिन्दी</option>
+                            <option value="gu">ગુજરાતી</option>
+                            <option value="mr">मराठी</option>
+                            <option value="ta">தமிழ்</option>
+                            <option value="te">తెలుగు</option>
+                            <option value="pa">ਪੰਜਾਬੀ</option>
+                        </select>
+                    </div>
+                </li>
+
                 <li>
                     <button id="theme-toggle" class="theme-toggle-btn" aria-label="Toggle dark mode">
                         <i class="fas fa-moon"></i>
                     </button>
                 </li>
-                <li><a href="/analyze" class="btn btn-primary">Get Started</a></li>
+                <li><a href="/analyze" class="btn btn-primary" data-i18n="navbar.getStarted">Get Started</a></li>
             </ul>
         </div>
     </nav>
@@ -354,27 +377,27 @@
                     <div class="hero-badge-wrapper">
                         <span class="hero-badge">
                             <span class="badge-dot"></span>
-                            AI-DRIVEN COTTON INTEGRATION
+                            <span data-i18n="hero.badge">AI-DRIVEN COTTON INTEGRATION</span>
                         </span>
                     </div>
                 
                     <h1 class="typewriter">
-                        <span class="line1">AI-Powered</span>
-                        <span class="line2">Cotton Crop Intelligence</span>
+                        <span class="line1" data-i18n="hero.title1">AI-Powered</span>
+                        <span class="line2" data-i18n="hero.title2">Cotton Crop Intelligence</span>
                     </h1>
                 
-                    <p>
+                    <p data-i18n="hero.desc">
                         Analyze crop maturity, detect plant health issues, and optimize
                         harvest timing using smart real-time deep learning analytics.
                     </p>
                 
                     <div class="hero-cta">
                         <a href="/analyze" class="btn btn-primary">
-                            <i class="fas fa-camera"></i> Analyze Image
+                            <i class="fas fa-camera"></i> <span data-i18n="hero.analyzeBtn">Analyze Image</span>
                         </a>
                        
                         <a href="/demo" class="btn btn-secondary">
-                            <i class="fas fa-play-circle"></i> View Demo
+                            <i class="fas fa-play-circle"></i> <span data-i18n="hero.demoBtn">View Demo</span>
                         </a>
                     </div>
                 </div>
@@ -490,7 +513,7 @@
         <div class="footer-container">
             <div class="footer-brand">
                 <h2 class="footer-title"><i class="fas fa-leaf"></i> Agri-Vision</h2>
-                <p class="footer-subtitle">Empowering cotton farmers with AI-driven insights.</p>
+                <p class="footer-subtitle" data-i18n="footer.subtitle">Empowering cotton farmers with AI-driven insights.</p>
             </div>
             <!-- =========================================================
                 Footer Navigation Links
@@ -505,13 +528,13 @@
                 improving overall platform usability.
             ========================================================= -->
             <div class="footer-links-compact">
-                <a href="/">Home</a>
-                <a href="/analyze">Analyze</a>
-                <a href="/comparison">Field Comparison</a>
-                <a href="{{ url_for('dashboard') }}">Dashboard</a>
-                <a href="/demo">Demo</a>
-                <a href="/tutorials">Tutorials</a>
-                <a href="{{ url_for('support') }}">Support</a>
+                <a href="/" data-i18n="navbar.home">Home</a>
+                <a href="/analyze" data-i18n="navbar.analyze">Analyze</a>
+                <a href="/comparison" data-i18n="navbar.comparison">Field Comparison</a>
+                <a href="{{ url_for('dashboard') }}" data-i18n="footer.dashboard">Dashboard</a>
+                <a href="/demo" data-i18n="navbar.demo">Demo</a>
+                <a href="/tutorials" data-i18n="navbar.tutorials">Tutorials</a>
+                <a href="{{ url_for('support') }}" data-i18n="footer.support">Support</a>
             </div>
         </div>
         <!-- =========================================================
@@ -525,8 +548,8 @@
             and strengthens overall UI completeness.
         ========================================================= -->
         <div class="footer-bottom">
-            <p>&copy; <span id="year"></span> Agri-Vision. All rights reserved.</p>
-            <p>
+            <p>&copy; <span id="year"></span> <span data-i18n="footer.rights">Agri-Vision. All rights reserved.</span></p>
+            <p data-i18n="footer.tagline">
                 Smart Cotton Crop Analysis System
             </p>
 
