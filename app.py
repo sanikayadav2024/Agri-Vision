@@ -2167,7 +2167,15 @@ def api_analyze_stream():
 
             image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
             compressed_rgb = resize_image(image_rgb, MAX_INFERENCE_DIMENSION)
-            results = analyze_image(compressed_rgb)
+            yield f"data: {json.dumps({'step': 'upload_received', 'progress': 20, 'message': 'Image received, starting analysis...'})}\n\n"
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(analyze_image, compressed_rgb)
+                try:
+                    results = future.result(timeout=60)
+                except concurrent.futures.TimeoutError:
+                    yield f"data: {json.dumps({'step': 'error', 'progress': 100, 'message': 'Analysis timed out after 60 seconds. Please retry with a clearer image.'})}\n\n"
+                    return
             if results.get("error"):
                 yield f"data: {json.dumps({'status': 'error', 'message': results['error']})}\n\n"
                 return
