@@ -289,14 +289,13 @@
                 opacity: 0.7;
             }
         }
-<<<<<<< HEAD
+
         [data-theme="dark"] .user-message {
           background: linear-gradient(135deg, #16a34a, #14532d) !important;
           color: #ffffff !important;
           border: 1px solid rgba(255,255,255,0.08);
           box-shadow: 0 2px 10px rgba(0,0,0,0.25);
         }
-=======
 
         /* Mobile Navigation Styles */
         .nav-toggle {
@@ -478,7 +477,6 @@
             }
         }
 
->>>>>>> 0d24408e2cda98d92efd5a9f69935bc9bc9dfb87
     </style>
 <script type="text/javascript">
 function googleTranslateElementInit() {
@@ -547,8 +545,7 @@ src="//translate.google.com/translate_a/element.js?cb=googleTranslateElementInit
             </ul>
         </div>
     </nav>
-<!-- =========================================================
-     Temporary Merge Conflict Text Cleanup
+
     <!-- Main Content -->
     <div class="main-content">
         {% with messages = get_flashed_messages(with_categories=true) %}
@@ -819,63 +816,51 @@ src="//translate.google.com/translate_a/element.js?cb=googleTranslateElementInit
         document.getElementById("year").textContent = new Date().getFullYear();
     </script>
     <script>
-
         document.addEventListener('DOMContentLoaded', () => {
-            const themeToggleBtn = document.getElementById('theme-toggle');
-            const themeIcon = document.querySelector('#theme-toggle i');
-            if (!document.documentElement.getAttribute('data-theme')) {
-                document.documentElement.setAttribute('data-theme', 'light');
-            }
-            const savedTheme = localStorage.getItem('theme');
-            if (savedTheme === 'dark') {
-                document.documentElement.setAttribute('data-theme', 'dark');
-                themeIcon.classList.replace('fa-moon', 'fa-sun');
-            } else {
-            
-                icon.classList.remove("fa-sun");
-                icon.classList.add("fa-moon");
-            }
+
+    const themeToggleBtn = document.getElementById('theme-toggle');
+    const themeIcon = document.querySelector('#theme-toggle i');
+
+    function updateThemeIcon(theme) {
+        if (theme === "dark") {
+            themeIcon.classList.remove("fa-moon");
+            themeIcon.classList.add("fa-sun");
+        } else {
+            themeIcon.classList.remove("fa-sun");
+            themeIcon.classList.add("fa-moon");
         }
-    
-        // Load saved theme
-        const savedTheme =
-            localStorage.getItem("theme") || "light";
-    
+    }
+
+    const savedTheme = localStorage.getItem("theme") || "light";
+
+    document.documentElement.setAttribute(
+        "data-theme",
+        savedTheme
+    );
+
+    updateThemeIcon(savedTheme);
+
+    themeToggleBtn.addEventListener("click", () => {
+
+        const currentTheme =
+            document.documentElement.getAttribute("data-theme");
+
+        const newTheme =
+            currentTheme === "dark"
+            ? "light"
+            : "dark";
+
         document.documentElement.setAttribute(
             "data-theme",
-            savedTheme
+            newTheme
         );
-    
-        updateThemeIcon(savedTheme);
-    
-        // Toggle theme
-        themeToggleBtn.addEventListener("click", () => {
-        
-            const currentTheme =
-                document.documentElement.getAttribute(
-                    "data-theme"
-                );
-        
-            const newTheme =
-                currentTheme === "dark"
-                ? "light"
-                : "dark";
-        
-            document.documentElement.setAttribute(
-                "data-theme",
-                newTheme
-            );
-        
-            localStorage.setItem(
-                "theme",
-                newTheme
-            );
-        
-            updateThemeIcon(newTheme);
-        });
-    
+
+        localStorage.setItem("theme", newTheme);
+
+        updateThemeIcon(newTheme);
     });
-    
+
+});
     </script>
     <script>
         window.addEventListener('scroll', function() {
@@ -1173,3 +1158,4 @@ setInterval(createLeaf, 150);
 </body>
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
 </html>
+{% endblock %}
