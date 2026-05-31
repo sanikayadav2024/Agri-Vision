@@ -845,6 +845,13 @@ def build_comparison_result(old_results: Dict[str, Any], new_results: Dict[str, 
     }
 
 
+# --- Security Headers ---
+@app.after_request
+def apply_security_headers(response):
+    response.headers["X-Frame-Options"] = "SAMEORIGIN"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    return response
 # -------------------------------------------------------------------
 # FLASK ROUTES
 # -------------------------------------------------------------------
