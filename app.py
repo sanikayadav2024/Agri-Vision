@@ -11,14 +11,23 @@ import os
 import random
 import math
 import re
+import functools
 import threading
 from datetime import datetime
 from typing import Any, Dict, Optional, Tuple
 from werkzeug.utils import secure_filename
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
+from flask_talisman import Talisman
 from io import BytesIO
 from services.weather_service import get_weather
+from services.model_cache import (
+    init_cache_backend,
+    get_cached_prediction,
+    cache_prediction,
+    cache_stats as inference_cache_stats,
+)
+from sqlalchemy import inspect, text
 
 import redis
 import base64
@@ -48,14 +57,24 @@ import json
 from jinja2 import Environment, FileSystemLoader
 from model_registry import registry
 from services.weather_service import generate_weather_recommendations
+from services.yield_history_service import build_yield_history_report
 from services.yield_service import estimate_yield
+from services.auth_security_service import (
+    AccountLockoutService,
+    get_client_ip,
+    get_user_agent,
+)
 from security_utils import (
     UploadValidationError,
     cleanup_temp_upload,
     resolve_secret_key,
     save_temp_upload,
     validate_image_upload,
+    is_production_env,
 )
+from auth.authorization import require_role, require_any_role, require_permission
+from models import Role, Permission, RolePermission, UserRole
+
 
 load_dotenv()
 
@@ -74,6 +93,15 @@ redis_port = int(os.getenv("REDIS_PORT", "6379"))
 redis_db = int(os.getenv("REDIS_DB", "0"))
 limiter_storage_uri = "memory://"
 
+# Model warm-up configuration
+MODEL_LOAD_TIMEOUT: int = int(os.getenv("MODEL_LOAD_TIMEOUT", "60"))  # seconds
+
+# Async model warm-up state — set by background thread, read by /health
+_model_load_event: threading.Event = threading.Event()
+_model_load_status: dict = {"status": "loading", "error": None}
+
+is_prod = is_production_env(os.environ)
+
 try:
     redis_client = redis.Redis(
         host=redis_host,
@@ -85,9 +113,15 @@ try:
     redis_client.ping()
     limiter_storage_uri = f"redis://{redis_host}:{redis_port}/{redis_db}"
     logger.info("redis connected for caching and rate limiting")
+    # Wire Redis into the inference result cache backend
+    init_cache_backend(redis_client)
 except (redis.exceptions.ConnectionError, ModuleNotFoundError) as err:
-    logger.warning(f"caching layer bypass active: {err}")
     redis_client = None
+    init_cache_backend(None)  # fall back to in-memory inference cache
+    if is_prod:
+        logger.warning(f"limiter falling back to memory storage in production! Redis is required for rate limit consistency across workers. Error: {err}")
+    else:
+        logger.warning(f"caching layer bypass active: {err}")
 
 limiter = Limiter(
     get_remote_address,
@@ -97,6 +131,55 @@ limiter = Limiter(
 )
 from models import db
 db.init_app(app)
+
+
+_account_lockout_schema_checked = False
+
+
+def ensure_account_lockout_schema() -> None:
+    """Backfill account lockout columns for existing create_all-managed DBs."""
+    inspector = inspect(db.engine)
+    if "users" not in inspector.get_table_names():
+        return
+
+    existing_columns = {column["name"] for column in inspector.get_columns("users")}
+    dialect = db.engine.dialect.name
+    datetime_type = "TIMESTAMP" if dialect == "postgresql" else "DATETIME"
+    columns = {
+        "failed_login_attempts": "INTEGER NOT NULL DEFAULT 0",
+        "last_failed_login_at": datetime_type,
+        "account_locked_until": datetime_type,
+        "last_successful_login_at": datetime_type,
+        "last_failed_ip": "VARCHAR(64)",
+        "last_successful_ip": "VARCHAR(64)",
+    }
+
+    changed = False
+    with db.engine.begin() as connection:
+        for column_name, ddl_type in columns.items():
+            if column_name not in existing_columns:
+                connection.execute(text(f"ALTER TABLE users ADD COLUMN {column_name} {ddl_type}"))
+                changed = True
+        connection.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_users_account_locked_until "
+                "ON users (account_locked_until)"
+            )
+        )
+    if changed:
+        logger.info("Account lockout schema columns added to users table")
+
+
+@app.before_request
+def _ensure_account_lockout_schema_once() -> None:
+    global _account_lockout_schema_checked
+    if _account_lockout_schema_checked or app.config.get("TESTING"):
+        return
+    try:
+        ensure_account_lockout_schema()
+        _account_lockout_schema_checked = True
+    except Exception as exc:
+        logger.warning("Account lockout schema check skipped: %s", exc)
 
 # --- Login Manager Configuration ---
 login_manager = LoginManager()
@@ -109,6 +192,29 @@ login_manager.login_message_category = 'info'
 def load_user(user_id):
     from models import User
     return User.query.get(user_id)
+
+# --- Google OAuth 2.0 Configuration (issue #626) ---
+from authlib.integrations.flask_client import OAuth as _OAuth
+
+_oauth = _OAuth(app)
+_google_client_id = os.getenv("GOOGLE_CLIENT_ID", "")
+_google_client_secret = os.getenv("GOOGLE_CLIENT_SECRET", "")
+
+if _google_client_id and _google_client_secret:
+    _oauth.register(
+        name="google",
+        client_id=_google_client_id,
+        client_secret=_google_client_secret,
+        server_metadata_url="https://accounts.google.com/.well-known/openid-configuration",
+        client_kwargs={"scope": "openid email profile"},
+    )
+    GOOGLE_OAUTH_ENABLED = True
+    logger.info("Google OAuth 2.0 enabled.")
+else:
+    GOOGLE_OAUTH_ENABLED = False
+    logger.warning(
+        "GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET not set — Google OAuth disabled."
+    )
 
 from functools import wraps
 
@@ -138,6 +244,44 @@ app.request_class = CustomRequest
 swagger = Swagger(app)
 CORS(app)
 
+csp = {
+    'default-src': ["'self'"],
+    'script-src': [
+        "'self'",
+        'cdnjs.cloudflare.com',
+        'unpkg.com',
+        'cdn.jsdelivr.net',
+        "'unsafe-inline'",
+        "'unsafe-eval'"
+    ],
+    'style-src': [
+        "'self'",
+        "'unsafe-inline'",
+        'cdnjs.cloudflare.com',
+        'unpkg.com'
+    ],
+    'img-src': [
+        "'self'",
+        'data:',
+        'images.unsplash.com',
+        'developers.google.com',
+        'unpkg.com',
+        '*.openstreetmap.org'
+    ],
+    'frame-src': [
+        "'self'",
+        'https://www.youtube.com',
+        'https://youtube.com'
+    ],
+    'font-src': [
+        "'self'",
+        'cdnjs.cloudflare.com'
+    ],
+    'connect-src': ["'self'"]
+}
+Talisman(app, content_security_policy=csp, force_https=False)
+
+
 app.config["TEMPLATES_AUTO_RELOAD"] = True
 app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0
 app.jinja_env.auto_reload = True
@@ -153,7 +297,7 @@ app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024
 app.config["MAX_FORM_MEMORY_SIZE"] = 25 * 1024 * 1024
 app.config.setdefault("UPLOAD_MAX_BYTES", app.config["MAX_CONTENT_LENGTH"])
 app.config.setdefault("UPLOAD_RATE_LIMIT", "10 per minute")
-app.config.setdefault("API_UPLOAD_RATE_LIMIT", "20 per minute")
+app.config.setdefault("API_UPLOAD_RATE_LIMIT", "10 per minute")
 app.config.setdefault("UPLOAD_TMP_DIR", os.path.join(app.instance_path, "uploads"))
 os.makedirs(app.config["UPLOAD_TMP_DIR"], exist_ok=True)
 
@@ -288,7 +432,8 @@ class ModelManager:
                             RESNET_MODEL_PATH,
                             map_location=torch.device("cpu"),
                         )
-                    except TypeError:
+                    except (RuntimeError, Exception) as exc:
+                        logger.debug(f"ResNet50 with weights_only=True failed, retrying with weights_only=False: {exc}")
                         self.resnet_model = torch.load(
                             RESNET_MODEL_PATH,
                             map_location=torch.device("cpu"),
@@ -297,9 +442,13 @@ class ModelManager:
                     self.resnet_model.eval()
                     self.errors["resnet"] = None
                     logger.info("ResNet50 model loaded successfully")
-                except Exception as exc:
+                except (FileNotFoundError, RuntimeError, TypeError) as exc:
                     self.errors["resnet"] = str(exc)
-                    logger.warning(f"ResNet50 model not found or failed to load: {exc}")
+                    logger.error(f"ResNet50 model failed to load from {RESNET_MODEL_PATH}: {exc}")
+                    self.resnet_model = None
+                except Exception as exc:
+                    self.errors["resnet"] = "Model failed to load. See server logs for details."
+                    logger.warning(f"ResNet50 model not found or failed to load: {exc}", exc_info=True)
                     self.resnet_model = None
 
             if self.yolo_model is None:
@@ -308,8 +457,8 @@ class ModelManager:
                     self.errors["yolo"] = None
                     logger.info("YOLOv8 model loaded successfully")
                 except Exception as exc:
-                    self.errors["yolo"] = str(exc)
-                    logger.warning(f"YOLOv8 model not found or failed to load: {exc}")
+                    self.errors["yolo"] = "Model failed to load. See server logs for details."
+                    logger.warning(f"YOLOv8 model not found or failed to load: {exc}", exc_info=True)
                     self.yolo_model = None
 
             self.loaded = True
@@ -337,7 +486,9 @@ yolo_model = None
 grad_cam_instance = None
 
 
+@functools.lru_cache(maxsize=1)
 def load_models():
+    """Delegate to ModelManager singleton for thread-safe model loading."""
     global resnet_model, yolo_model
     if resnet_model is None:
         try:
@@ -362,8 +513,41 @@ def load_models():
             yolo_model = None
     return resnet_model, yolo_model
 
+
 def ensure_models_loaded() -> None:
     load_models()
+
+
+def _background_model_warmup() -> None:
+    """
+    Load both models in a daemon thread so the Flask app can accept requests
+    immediately.  Sets _model_load_event once complete (success or failure).
+    Logs CRITICAL if loading exceeds MODEL_LOAD_TIMEOUT seconds.
+    """
+    import time
+    global _model_load_status
+    start = time.monotonic()
+    try:
+        logger.info("[warm-up] Starting async model loading (timeout=%ds)...", MODEL_LOAD_TIMEOUT)
+        model_manager.load_models()  # thread-safe double-checked locking inside
+        elapsed = time.monotonic() - start
+        if elapsed > MODEL_LOAD_TIMEOUT:
+            msg = (
+                f"[warm-up] Models loaded but exceeded timeout threshold "
+                f"({elapsed:.1f}s > {MODEL_LOAD_TIMEOUT}s). "
+                "Consider increasing MODEL_LOAD_TIMEOUT or using a GPU."
+            )
+            logger.critical(msg)
+            _model_load_status = {"status": "timeout", "error": msg}
+        else:
+            logger.info("[warm-up] Models ready in %.2fs.", elapsed)
+            _model_load_status = {"status": "ready", "error": None}
+    except Exception as exc:  # pragma: no cover
+        logger.critical("[warm-up] Model loading FAILED: %s", exc, exc_info=True)
+        _model_load_status = {"status": "error", "error": str(exc)}
+    finally:
+        _model_load_event.set()  # unblock /health waiters regardless of outcome
+
 
 
 # -------------------------------------------------------------------
@@ -501,14 +685,28 @@ class GradCAM:
 # -------------------------------------------------------------------
 # INFERENCE PIPELINE
 # -------------------------------------------------------------------
-def preprocess_image_for_resnet(image: np.ndarray, target_size: Tuple[int, int] = (224, 224)) -> torch.Tensor:
-    transform = transforms.Compose([
-        transforms.ToPILImage(),
-        transforms.Resize(target_size),
-        transforms.ToTensor(),
-    ])
-    tensor = transform(image).unsqueeze(0)
-    return tensor
+
+# Define ONCE at module level — built once, reused every request.
+# Includes ImageNet normalization required by ResNet50 for correct inference.
+RESNET_TRANSFORM = transforms.Compose([
+    transforms.ToPILImage(),
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize(
+        mean=[0.485, 0.456, 0.406],
+        std=[0.229, 0.224, 0.225],
+    ),
+])
+
+
+def preprocess_image_for_resnet(image: np.ndarray) -> torch.Tensor:
+    """Preprocess an RGB numpy image for ResNet50 inference.
+
+    Uses the module-level RESNET_TRANSFORM pipeline which includes
+    ImageNet normalization (mean=[0.485, 0.456, 0.406],
+    std=[0.229, 0.224, 0.225]).
+    """
+    return RESNET_TRANSFORM(image).unsqueeze(0)
 
 
 def infer_disease(image):
@@ -740,9 +938,26 @@ def read_validated_upload_image(file_storage) -> Tuple[str, np.ndarray, np.ndarr
         max_bytes=max_bytes,
     )
     temp_path = save_temp_upload(file_bytes, app.config["UPLOAD_TMP_DIR"], safe_filename)
+
+    try:
+        img = Image.open(BytesIO(file_bytes))
+        img.verify()
+    except (IOError, OSError, ValueError) as e:
+        logger.warning(f"Image validation failed during PIL verify: {e}")
+        raise UploadValidationError(
+            "Unable to process this image. It may be corrupt or in an unsupported format.",
+            status_code=400,
+        )
+    except Exception as e:
+        logger.exception(f"Unexpected error during image verification: {e}")
+        raise UploadValidationError(
+            "Unable to process this image. It may be corrupt or in an unsupported format.",
+            status_code=400,
+        )
+
     image = cv2.imdecode(np.frombuffer(file_bytes, np.uint8), cv2.IMREAD_COLOR)
     if image is None:
-        raise UploadValidationError("Invalid image file.", status_code=400)
+        raise UploadValidationError("Unable to process this image. It may be corrupt or in an unsupported format.", status_code=400)
     return safe_filename, image, cv2.cvtColor(image, cv2.COLOR_BGR2RGB), temp_path
 
 
@@ -794,12 +1009,28 @@ def generate_gradcam_explanation(
     return grad_cam_image_b64, heatmap_only_b64
 
 
-def analyze_image(image: np.ndarray,*,weather:Optional[dict]=None,field_acres: float=1.0) -> Dict[str, Any]:
+def analyze_image(image: np.ndarray, image_bytes: Optional[bytes] = None, *, weather: Optional[dict] = None, field_acres: float = 1.0) -> Dict[str, Any]:
     import time
     start_time = time.time()
-    field_acres=normalize_field_acres(field_acres)
-    
-    
+    field_acres = normalize_field_acres(field_acres)
+
+    # --- Inference result cache check (skip blobs; they come from GradCAM cache) ---
+    if image_bytes is not None:
+        cached = get_cached_prediction(image_bytes)
+        if cached is not None:
+            logger.info("[cache] Inference result cache HIT — skipping ML inference")
+            # Re-attach heatmaps from in-process GradCAM cache if available
+            image_hash = hashlib.sha256(image_bytes).hexdigest()
+            gradcam_hit = get_cached_grad_cam(image_hash)
+            if gradcam_hit:
+                cached["grad_cam_image_b64"] = gradcam_hit[0]
+                cached["heatmap_only_b64"] = gradcam_hit[1]
+                if "disease" in cached:
+                    cached["disease"]["heatmap_b64"] = gradcam_hit[0]
+                    cached["disease"]["heatmap_only_b64"] = gradcam_hit[1]
+            cached.setdefault("_cache_hit", True)
+            return cached
+
     resnet_model, yolo_model = model_manager.load_models()
     try:
         try:
@@ -913,6 +1144,14 @@ def analyze_image(image: np.ndarray,*,weather:Optional[dict]=None,field_acres: f
                 "Disease analysis is still provided, but comparison may be less reliable without a confirmed cotton crop detection.",
                 "Grad-CAM explainability may also be affected if the primary crop is not detected.",
             ]
+
+        # --- Store result in inference cache (blobs stripped inside cache_prediction) ---
+        if image_bytes is not None:
+            try:
+                cache_prediction(image_bytes, result)
+                logger.info("[cache] Inference result cached for future requests")
+            except Exception as cache_exc:
+                logger.warning("[cache] Failed to cache inference result: %s", cache_exc)
 
         return result
     except Exception as exc:
@@ -1052,6 +1291,27 @@ def is_pytest_mode() -> bool:
     return "PYTEST_CURRENT_TEST" in os.environ
 
 
+@app.route("/health")
+def health_check():
+    """
+    Readiness endpoint.
+
+    Returns HTTP 503 with {"status": "loading"} while models are being warmed up
+    in the background thread, and HTTP 200 with {"status": "ready"} once they are
+    available.  Kubernetes / Docker HEALTHCHECK probes should wait for 200.
+    """
+    ready = _model_load_event.is_set()
+    status = _model_load_status.get("status", "loading")
+    payload = {
+        "status": status if ready else "loading",
+        "models": model_manager.diagnostics() if ready else {},
+        "cache": inference_cache_stats(),
+    }
+    if not ready or status not in ("ready", "timeout"):
+        return jsonify(payload), 503
+    return jsonify(payload), 200
+
+
 @app.route("/")
 def index():
     lang = request.args.get("lang", "en")
@@ -1087,10 +1347,8 @@ def stories():
 
 @app.route("/model-admin")
 @login_required
+@require_any_role(['researcher', 'admin'])
 def admin_dashboard():
-    if not current_user.is_researcher():
-        flash('Access denied. Researchers and Admins only.', 'danger')
-        return redirect(url_for('index'))
     return render_template("admin.html")
 
 
@@ -1110,8 +1368,8 @@ def list_models():
             "rollback_threshold": registry.rollback_threshold
         })
     except Exception as e:
-        logger.error(f"Error listing models: {e}")
-        return jsonify({"error": str(e)}), 500
+        logger.error(f"Error listing models: {e}", exc_info=True)
+        return jsonify({"error": "An internal server error occurred"}), 500
 
 @app.route('/admin/models/active', methods=['GET'])
 def get_active_models():
@@ -1127,8 +1385,8 @@ def get_active_models():
             }
         })
     except Exception as e:
-        logger.error(f"Error getting active models: {e}")
-        return jsonify({"error": str(e)}), 500
+        logger.error(f"Error getting active models: {e}", exc_info=True)
+        return jsonify({"error": "An internal server error occurred"}), 500
 
 @app.route('/admin/models/register', methods=['POST'])
 def register_model():
@@ -1158,9 +1416,8 @@ def register_model():
     except FileNotFoundError as e:
         return jsonify({"error": str(e)}), 404
     except Exception as e:
-        logger.error(f"Error registering model: {e}")
-        return jsonify({"error": str(e)}), 500
-
+        logger.error(f"Error registering model: {e}", exc_info=True)
+        return jsonify({"error": "An internal server error occurred"}), 500
 @app.route('/admin/models/activate', methods=['POST'])
 def activate_model():
     """Set a model version as active"""
@@ -1179,9 +1436,9 @@ def activate_model():
     except ValueError as e:
         return jsonify({"error": str(e)}), 404
     except Exception as e:
-        logger.error(f"Error activating model: {e}")
-        return jsonify({"error": str(e)}), 500
-
+        logger.error(f"Error activating model: {e}", exc_info=True)
+        return jsonify({"error": "An internal server error occurred"}), 500
+    
 @app.route('/admin/models/delete', methods=['DELETE'])
 def delete_model():
     """Delete a model version"""
@@ -1200,8 +1457,8 @@ def delete_model():
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     except Exception as e:
-        logger.error(f"Error deleting model: {e}")
-        return jsonify({"error": str(e)}), 500
+        logger.error(f"Error deleting model: {e}", exc_info=True)
+        return jsonify({"error": "An internal server error occurred"}), 500
 
 @app.route('/admin/models/ab-testing', methods=['POST'])
 def toggle_ab_testing():
@@ -1216,8 +1473,8 @@ def toggle_ab_testing():
             "ab_test_enabled": registry.ab_test_enabled
         })
     except Exception as e:
-        logger.error(f"Error toggling A/B testing: {e}")
-        return jsonify({"error": str(e)}), 500
+        logger.error(f"Error toggling A/B testing: {e}", exc_info=True)
+        return jsonify({"error": "An internal server error occurred"}), 500
 
 @app.route('/admin/models/ab-ratio', methods=['POST'])
 def set_ab_ratio():
@@ -1237,8 +1494,8 @@ def set_ab_ratio():
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     except Exception as e:
-        logger.error(f"Error setting A/B ratio: {e}")
-        return jsonify({"error": str(e)}), 500
+        logger.error(f"Error setting A/B ratio: {e}", exc_info=True)
+        return jsonify({"error": "An internal server error occurred"}), 500
 
 @app.route('/admin/models/metrics', methods=['GET'])
 def get_model_metrics():
@@ -1250,8 +1507,8 @@ def get_model_metrics():
             "metrics": models
         })
     except Exception as e:
-        logger.error(f"Error getting model metrics: {e}")
-        return jsonify({"error": str(e)}), 500
+        logger.error(f"Error getting model metrics: {e}", exc_info=True)
+        return jsonify({"error": "An internal server error occurred"}), 500
 
 @app.route('/admin/models/rollback-threshold', methods=['POST'])
 def set_rollback_threshold():
@@ -1273,8 +1530,8 @@ def set_rollback_threshold():
             "rollback_threshold": registry.rollback_threshold
         })
     except Exception as e:
-        logger.error(f"Error setting rollback threshold: {e}")
-        return jsonify({"error": str(e)}), 500
+        logger.error(f"Error setting rollback threshold: {e}", exc_info=True)
+        return jsonify({"error": "An internal server error occurred"}), 500
 
 
 @app.route('/admin/models/export/pdf', methods=['GET'])
@@ -1350,8 +1607,8 @@ def export_pdf():
     except ImportError:
         return jsonify({"error": "reportlab not installed. Install with: pip install reportlab"}), 500
     except Exception as e:
-        logger.error(f"Error generating PDF: {e}")
-        return jsonify({"error": str(e)}), 500
+        logger.error(f"Error generating PDF: {e}", exc_info=True)
+        return jsonify({"error": "An internal server error occurred"}), 500
 
 
 @app.route("/api/analyze/download-report", methods=["POST"])
@@ -1671,25 +1928,64 @@ def download_analysis_report():
         return jsonify({"error": f"Failed to generate PDF: {str(e)}"}), 500
 
 
-@app.route("/history")
-def history():
-    return render_template("history.html")
+@app.route("/compare")
+@login_required
+def compare():
+    ids_param = request.args.get('ids', '')
+    if not ids_param:
+        flash("No analyses selected for comparison", "warning")
+        return redirect(url_for('history'))
+
+    analysis_ids = [aid.strip() for aid in ids_param.split(',') if aid.strip()]
+
+    from models import AnalysisHistory
+    analyses = AnalysisHistory.query.filter(
+        AnalysisHistory.id.in_(analysis_ids),
+        AnalysisHistory.user_id == current_user.id
+    ).all()
+
+    if not analyses:
+        flash("No valid analyses found", "warning")
+        return redirect(url_for('history'))
+
+    canonical_fields = [
+        ('disease', 'Detected Disease'),
+        ('growth_stage', 'Growth Stage'),
+        ('confidence', 'Confidence'),
+        ('health_score', 'Health Score'),
+        ('created_at', 'Analysis Date'),
+    ]
+
+    rows = []
+    for key, label in canonical_fields:
+        row = {"label": label, "key": key, "values": []}
+        for analysis in analyses:
+            if key == 'disease':
+                val = (analysis.disease_result or {}).get('predicted_class')
+            elif key == 'growth_stage':
+                val = (analysis.growth_result or {}).get('main_class')
+            elif key == 'confidence':
+                val = analysis.confidence
+            elif key == 'health_score':
+                val = analysis.health_score
+            elif key == 'created_at':
+                val = analysis.created_at.strftime('%Y-%m-%d %H:%M') if analysis.created_at else None
+            else:
+                val = None
+            row["values"].append(val)
+        rows.append(row)
+
+    return render_template('compare.html',
+        analyses=analyses,
+        rows=rows,
+        enumerate=enumerate,
+    )
 
 
 @app.route("/health")
 def health():
-    ensure_models_loaded()
-    diagnostics = model_manager.diagnostics()
-    model_loaded = diagnostics["resnet"]["loaded"] and diagnostics["yolo"]["loaded"]
-    status_code = 200 if model_loaded else 503
-    return jsonify({
-        "status": "healthy" if model_loaded else "degraded",
-        "mode": "ready" if model_loaded else "degraded",
-        "timestamp": datetime.now().isoformat(),
-        "model_loaded": model_loaded,
-        "models": diagnostics,
-        "service": "Agri-Vision Cotton Analysis API",
-    }), status_code
+    """Alias kept for backwards compatibility — delegates to health_check."""
+    return health_check()
 
 
 @app.route("/analyze", methods=["GET", "POST"])
@@ -1707,6 +2003,9 @@ def analyze():
 
             file = request.files["file"]
             safe_filename, image, image_rgb, temp_path = read_validated_upload_image(file)
+            # Read raw bytes for cache keying (file already consumed; re-read from temp)
+            file.seek(0)
+            _raw_image_bytes = file.read() or None
             compressed_rgb = resize_image(image_rgb, MAX_INFERENCE_DIMENSION)
 
             lat = request.form.get("lat", type=float)
@@ -1716,7 +2015,7 @@ def analyze():
 
             weather=resolve_weather_for_analysis(lat=lat,lon=lon,city=city)
 
-            results = analyze_image(compressed_rgb,weather=weather,field_acres=field_acres)
+            results = analyze_image(compressed_rgb, image_bytes=_raw_image_bytes, weather=weather, field_acres=field_acres)
 
             if results.get("error"):
                 raise ValueError(results["error"])
@@ -1758,14 +2057,15 @@ def analyze():
                 disease_info=disease_info,
             )
         except UploadValidationError as exc:
-            logger.warning("Upload rejected: %s", exc)
+            filename = request.files.get("file", {}).filename if request.files.get("file") else "unknown"
+            logger.warning("Upload rejected (user=%s, file=%s): %s", current_user.id, filename, exc)
             if exc.status_code == 413:
                 return ("File too large", 413)
             flash(str(exc), "error")
             return redirect(request.url)
         except Exception as exc:
-            logger.error("Analysis error: %s", exc)
-            flash(f"Error during analysis: {str(exc)}", "error")
+            logger.error("Analysis error: %s", exc, exc_info=True)
+            flash(f"Error during analysis. Please try again.", "error")
             return redirect(request.url)
         finally:
             cleanup_temp_upload(temp_path)
@@ -1789,9 +2089,11 @@ def api_explain():
     try:
         _, image, image_rgb = read_uploaded_image(file)
         compressed_rgb = resize_image(image_rgb, MAX_INFERENCE_DIMENSION)
+        file.seek(0)
+        _raw_image_bytes = file.read() or None
         
         # We just need to call analyze_image to generate the Grad-CAM and get results
-        results = analyze_image(compressed_rgb)
+        results = analyze_image(compressed_rgb, image_bytes=_raw_image_bytes)
         
         if "error" in results:
             return jsonify({"status": "error", "error": results["error"]}), 500
@@ -1808,8 +2110,8 @@ def api_explain():
             "confidence": disease_result.get("confidence", 0.0)
         })
     except Exception as exc:
-        logger.error("Error in API explain endpoint: %s", exc)
-        return jsonify({"status": "error", "error": str(exc)}), 500
+        logger.error("Error in API explain endpoint: %s", exc, exc_info=True)
+        return jsonify({"status": "error", "error": "An internal server error occurred"}), 500
 
 
 @app.route("/api/explain/target", methods=["POST"])
@@ -2031,14 +2333,21 @@ def demo():
         
         # Convert from BGR to RGB
         synthetic_rgb = cv2.cvtColor(synthetic_bgr, cv2.COLOR_BGR2RGB)
-        
+
+        # Write synthetic image as a demo file for target explainability to locate
+        os.makedirs("static/uploads", exist_ok=True)
+        cv2.imwrite(os.path.join("static", "uploads", "demo_cotton.jpg"), synthetic_bgr)
+
         # Generate mock heatmap
+        from services.gradcam import generate_pure_heatmap, apply_heatmap_on_image
         mock_heatmap = generate_mock_heatmap(synthetic_rgb)
+        pure_heatmap_rgb = generate_pure_heatmap(synthetic_rgb, mock_heatmap)
         mock_overlay = apply_heatmap_on_image(synthetic_rgb, mock_heatmap)
         
         # Base64 encode both original synthetic image and XAI overlay
         image_b64 = encode_image_for_display(synthetic_rgb)
         grad_cam_image_b64 = encode_image_for_display(mock_overlay)
+        heatmap_only_b64 = encode_image_for_display(pure_heatmap_rgb)
         
         # Set top-level and nested properties for robustness
         demo_disease["heatmap_b64"] = grad_cam_image_b64
@@ -2055,32 +2364,49 @@ def demo():
         
         # Generate farmer insights
         insights = generate_farmer_insights(demo_disease, demo_growth)
+
+        from services.recommendation_engine import get_recommendations
+        demo_treatment_recs = get_recommendations(
+            crop_type="cotton",
+            disease_name=demo_disease.get("predicted_class", "Healthy"),
+            confidence=demo_disease.get("confidence"),
+        )
     
         example_json = {
             "disease": demo_disease,
             "growth": demo_growth,
             "recommendations": generate_recommendations(demo_disease, demo_growth),
             "grad_cam_image_b64": grad_cam_image_b64,
+            "heatmap_only_b64": heatmap_only_b64,
+            "heatmap_image_path": None,
+            "heatmap_only_path": None,
             "disease_severity": severity,
             "yield_estimate": yield_est,
             "advanced_recommendations": adv_recs,
-            "farmer_insights": insights
+            "farmer_insights": insights,
+            "treatment_recommendations": demo_treatment_recs
         }
         return render_template(
             "results.html",
             results=example_json,
             filename="demo_cotton.jpg",
+            unique_filename="demo_cotton.jpg",
             image_b64=image_b64,
             img_shape={"width": 512, "height": 384},
             raw_json=json.dumps(example_json, indent=2),
             timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             grad_cam_image_b64=grad_cam_image_b64,
-            yield_estimate=yield_est
+            heatmap_only_b64=heatmap_only_b64,
+            heatmap_image_path=None,
+            heatmap_only_path=None,
+            yield_estimate=yield_est,
+            disease_info=disease_info_map.get("Healthy", {}),
+            treatment_recommendations=demo_treatment_recs,
+            weather=None,
         )
     except Exception as e:
         logger.error(f"Demo route failed: {e}")
         return redirect(url_for("index"))
-
 
 
 @app.route("/api/chat_test", methods=["GET"])
@@ -2095,14 +2421,48 @@ def api_chat():
     if not data or "message" not in data:
         return jsonify({"reply": "I'm sorry, I didn't receive a message."}), 400
 
-    message = str(data["message"]).lower()
+    message = str(data["message"]).strip()
+
+    # --- Try Gemini API first ---
+    gemini_key = os.getenv("GEMINI_API_KEY")
+    if gemini_key:
+        try:
+            import google.generativeai as genai
+            genai.configure(api_key=gemini_key)
+            model = genai.GenerativeModel("gemini-1.5-flash")
+
+            system_prompt = """You are Agri-Vision AI, an expert agricultural assistant specializing in cotton farming. 
+
+Your role:
+- Answer questions about cotton crops, farming practices, diseases, pests, irrigation, fertilizers, soil, seasons, and yield
+- Give concise, practical, farmer-friendly answers (2-4 sentences max)
+- For disease diagnosis, suggest uploading an image to the Agri-Vision Analyze tab
+- For questions unrelated to agriculture or farming, politely say: "I specialize in agricultural topics. Please ask me about farming, crops, or plant health!"
+- Never make up specific product names or prices
+- Always be helpful, warm, and encouraging to farmers"""
+
+            response = model.generate_content(f"{system_prompt}\n\nFarmer's question: {message}")
+            reply = response.text.strip()
+            return jsonify({"reply": reply})
+
+        except Exception as e:
+            logger.warning(f"Gemini API failed, falling back to regex: {e}")
+
+    # --- Fallback: regex-based responses ---
+    message_lower = message.lower()
     responses = {
         r"\b(hello|hi|hey|howdy|greetings)\b": [
             "Hello there! How can I assist you with your cotton crop today?",
             "Hi! Need any help analyzing your farm data?"
         ],
+        r"\b(season|seasons|when to (grow|plant|sow)|best time|months?|kharif|rabi)\b": [
+            "Cotton is a Kharif crop best sown between April and June in India, when temperatures are 25–35°C. It matures in 150–180 days and is harvested between October and January."
+        ],
+        r"\b(material|materials|require|requirement|requirements|need|needs|input|inputs|seed|seeds|equipment)\b": [
+            "To grow cotton you need: certified Bt cotton seeds, NPK fertilizers (especially potassium), drip irrigation setup, pesticides for bollworm control, and well-draining loamy soil with pH 6–8."
+        ],
         r"\b(disease|diseases|sick|spots?|rot|blight)\b": [
-            "If you're noticing leaf spots or rotting, it could be Bacterial Blight or Target Spot. I highly recommend taking a picture and uploading it to our Analyze tab for an AI diagnosis."
+            "If you're noticing leaf spots or rotting, it could be Bacterial Blight or Target Spot. Upload a picture to our Analyze tab for an AI diagnosis!"
         ],
         r"\b(yield|yields|harvest|harvests|produce)\b": [
             "Yield depends heavily on the crop's health score and current growth stage. Check out the Dashboard for predictions across your fields!"
@@ -2111,44 +2471,36 @@ def api_chat():
             "Cotton responds well to a balanced NPK fertilizer. During the blooming and early boll stages, potassium is critical to maximize yield."
         ],
         r"\b(water|watering|irrigation|dry|drought)\b": [
-            "Maintain regular watering during the blossom phase. However, once bolls mature and start splitting, you should reduce irrigation to prevent rot."
+            "Maintain regular watering during the blossom phase. Once bolls mature and start splitting, reduce irrigation to prevent rot."
         ],
         r"\b(pest|pests|worm|worms|aphid|aphids|bug|bugs|insect|insects|bollworm)\b": [
-            "Pests like Pink Bollworm and Aphids are common enemies of cotton. I recommend deploying pheromone traps and scouting the fields twice a week."
+            "Pests like Pink Bollworm and Aphids are common enemies of cotton. Deploy pheromone traps and scout fields twice a week."
         ],
         r"\b(weather|temperature|rain|rainfall|humidity|climate)\b": [
-            "Weather plays a huge role in cotton health. Hot, dry spells stress bolls while excess rain can encourage fungal diseases. Use our weather tab to monitor conditions."
+            "Hot, dry spells stress bolls while excess rain encourages fungal diseases. Use our weather tab to monitor conditions."
         ],
         r"\b(soil|soils|ph|minerals|clay|loam|sandy)\b": [
-            "Cotton thrives in well-draining loamy soil with a pH of 5.8–8.0. Conduct a soil test before the season to identify any nutrient deficiencies."
+            "Cotton thrives in well-draining loamy soil with a pH of 5.8–8.0. Conduct a soil test before the season to identify nutrient deficiencies."
         ],
-        r"\b(grow|growth|growing|stage|stages|seedling|boll|bolls|flower|flowering)\b": [
-            "Cotton growth has 5 key stages: germination, seedling, vegetative, flowering/boll formation, and maturity. Each stage has unique care needs — the flowering stage is most critical!"
-        ],
-        r"\b(spray|spraying|pesticide|pesticides|fungicide|herbicide|chemical)\b": [
-            "When spraying, always follow label rates and avoid spraying during peak heat or wind. Consider integrated pest management (IPM) to reduce chemical dependency."
+        r"\b(stage|stages|seedling|boll|bolls|flower|flowering|germination|vegetative)\b": [
+            "Cotton growth has 5 key stages: germination, seedling, vegetative, flowering/boll formation, and maturity. The flowering stage is most critical!"
         ],
         r"\b(thank(?:s|s you)?|awesome|great|perfect)\b": [
-            "You're welcome! Feel free to ask any time. Happy farming! 🌱",
-            "Glad I could help! Let me know if you have more questions about your cotton crop."
+            "You're welcome! Happy farming! 🌱"
         ],
         r"\b(help|assist|support|guide|advice|tips?)\b": [
-            "I'm here to help! You can ask me about crop diseases, yield optimization, pest control, irrigation, fertilization, weather impacts, or soil health.",
-            "Sure! Try asking about cotton diseases, pest control, yield estimates, or upload an image in the Analyze tab for an instant AI diagnosis."
-        ],
-        r"\b(cotton|crop|crops|farm|farming|field|fields)\b": [
-            "Agri-Vision specializes in cotton crop analysis. Upload a field image in the Analyze tab for disease detection, yield prediction, and health scoring!"
+            "I'm here to help! Ask me about crop diseases, yield optimization, pest control, irrigation, fertilization, or soil health."
         ],
     }
 
-    reply = "I'm your Agri-Vision AI assistant. I specialize in cotton farming, crop diseases, and yield optimization. How can I help you?"
+    reply = "I'm your Agri-Vision AI assistant specializing in cotton farming. Ask me about diseases, pests, irrigation, fertilizers, or crop seasons!"
 
     for pattern, reply_options in responses.items():
-        if re.search(pattern, message):
+        if re.search(pattern, message_lower):
             reply = random.choice(reply_options)
             break
-    return jsonify({"reply": reply})
 
+    return jsonify({"reply": reply})
 
 @app.route("/api/weather")
 def api_weather():
@@ -2174,8 +2526,21 @@ def api_weather():
     return jsonify({"status": "success", "weather": weather})
 
 
+@app.route("/api/yield/history")
+def api_yield_history():
+    """Return historical crop yield trend analytics."""
+    return jsonify(
+        build_yield_history_report(
+            crop=request.args.get("crop", "cotton"),
+            region=request.args.get("region"),
+        )
+    )
+
+
 @app.route("/api/analyze", methods=["POST"])
-@limiter.limit(lambda: app.config.get("API_UPLOAD_RATE_LIMIT", "20 per minute"))
+@app.route("/api/predict", methods=["POST"])
+@app.route("/predict", methods=["POST"])
+@limiter.limit(lambda: app.config.get("API_UPLOAD_RATE_LIMIT", "10 per minute"))
 def api_analyze():
     temp_path = None
     try:
@@ -2186,6 +2551,9 @@ def api_analyze():
 
         file = request.files["file"]
         _safe_filename, image, image_rgb, temp_path = read_validated_upload_image(file)
+        # Preserve raw bytes for cache keying before temp file cleanup
+        file.seek(0)
+        _raw_image_bytes = file.read() or None
         field_acres,field_acres_error=parse_api_field_acres(request.form.get("field_acres"))
         if field_acres_error:
             return jsonify({"error":field_acres_error}),400
@@ -2195,7 +2563,7 @@ def api_analyze():
         city=request.form.get("city",type=str)
         weather=resolve_weather_for_analysis(lat=lat,lon=lon,city=city)
         compressed_rgb = resize_image(image_rgb, MAX_INFERENCE_DIMENSION)
-        results = analyze_image(compressed_rgb, weather=weather, field_acres=field_acres)
+        results = analyze_image(compressed_rgb, image_bytes=_raw_image_bytes, weather=weather, field_acres=field_acres)
         return jsonify({
             "status": "success",
             "timestamp": datetime.now().isoformat(),
@@ -2204,11 +2572,12 @@ def api_analyze():
             
         })
     except UploadValidationError as exc:
-        logger.warning("API upload rejected: %s", exc)
+        filename = request.files.get("file", {}).filename if request.files.get("file") else "unknown"
+        logger.warning("API upload rejected (file=%s): %s", filename, exc)
         return jsonify({"error": str(exc)}), exc.status_code
     except Exception as e:
-        logger.error(f"API analysis error: {e}")
-        return jsonify({"error": str(e)}), 500
+        logger.error(f"API analysis error: {e}", exc_info=True)
+        return jsonify({"error": "An internal server error occurred"}), 500
     finally:
         cleanup_temp_upload(temp_path)
 
@@ -2239,15 +2608,15 @@ def api_analyze_stream():
             yield f"data: {json.dumps({'step': 'preprocessing', 'progress': 50, 'message': 'Analyzing crop health...'})}\n\n"
 
             image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            results = analyze_image(image_rgb)
+            results = analyze_image(image_rgb, image_bytes=image_bytes)
 
             yield f"data: {json.dumps({'step': 'recommendations', 'progress': 75, 'message': 'Generating prediction...'})}\n\n"
 
             yield f"data: {json.dumps({'step': 'complete', 'progress': 100, 'message': 'Analysis complete', 'data': results})}\n\n"
 
         except Exception as e:
-            logger.error(f"Streaming analysis error: {e}")
-            yield f"data: {json.dumps({'step': 'error', 'progress': 0, 'message': str(e)})}\n\n"
+            logger.error(f"Streaming analysis error: {e}", exc_info=True)
+            yield f"data: {json.dumps({'step': 'error', 'progress': 0, 'message': 'An internal server error occurred'})}\n\n"
 
     return Response(
         stream_with_context(generate()),
@@ -2262,6 +2631,7 @@ def api_analyze_stream():
 # --- Batch Processing Endpoints ---
 
 @app.route("/api/batch_upload", methods=["POST"])
+@limiter.limit("3 per minute")
 def api_batch_upload():
     """Upload multiple images for batch analysis"""
     try:
@@ -2339,14 +2709,14 @@ def api_batch_upload():
                         )
                         db.session.add(result)
                 except Exception as e:
-                    logger.error(f"Error processing image {filename}: {e}")
+                    logger.error(f"Error processing image {filename}: {e}", exc_info=True)
                     from models import AnalysisResult
                     result = AnalysisResult(
                         batch_job_id=job.id,
                         image_name=filename,
                         image_index=idx,
                         status='error',
-                        error_message=str(e)
+                        error_message="Failed to process this image. See server logs for details."
                     )
                     db.session.add(result)
             
@@ -2363,9 +2733,8 @@ def api_batch_upload():
         })
         
     except Exception as e:
-        logger.error(f"Batch upload error: {e}")
-        return jsonify({'error': str(e)}), 500
-
+        logger.error(f"Batch upload error: {e}", exc_info=True)
+        return jsonify({'error': 'An internal server error occurred'}), 500
 
 @app.route("/api/batch_status/<job_id>", methods=["GET"])
 def api_batch_status(job_id):
@@ -2650,34 +3019,135 @@ def batch_results_page(job_id):
 # --- Authentication Routes ---
 
 @app.route("/login", methods=["GET", "POST"])
+@limiter.limit("5 per minute")
 def login():
     """Login page"""
     if current_user.is_authenticated:
         return redirect(url_for('index'))
     
     if request.method == 'POST':
-        email = request.form.get('email')
-        password = request.form.get('password')
+        email = (request.form.get('email') or '').strip().lower()
+        password = request.form.get('password') or ''
         remember = request.form.get('remember')
+        ip_address = get_client_ip()
+        user_agent = get_user_agent()
+        lockout_service = AccountLockoutService()
         
         from models import User
         user = User.query.filter_by(email=email).first()
+
+        if user:
+            lockout_state = lockout_service.check_lockout(user)
+            if lockout_state.unlocked_expired_lock:
+                lockout_service.record_unlock(
+                    user,
+                    ip=ip_address,
+                    user_agent=user_agent,
+                )
+                db.session.commit()
+            if lockout_state.locked:
+                flash('Account temporarily locked. Please try again later.', 'danger')
+                return render_template(
+                    'login.html',
+                    google_oauth_enabled=GOOGLE_OAUTH_ENABLED,
+                ), 423
         
         if user and user.check_password(password):
             if not user.is_active:
                 flash('Your account has been deactivated. Please contact support.', 'danger')
-                return render_template('login.html')
+                return render_template('login.html', google_oauth_enabled=GOOGLE_OAUTH_ENABLED)
             
             login_user(user, remember=remember)
-            user.last_login = datetime.utcnow()
+            lockout_service.record_successful_login(
+                user,
+                ip=ip_address,
+                user_agent=user_agent,
+            )
+            user.last_login = user.last_successful_login_at
             db.session.commit()
             
             next_page = request.args.get('next')
             return redirect(next_page) if next_page else redirect(url_for('index'))
         else:
+            if user:
+                lockout_service.record_failed_login(
+                    user,
+                    ip=ip_address,
+                    user_agent=user_agent,
+                )
+                db.session.commit()
             flash('Invalid email or password', 'danger')
     
-    return render_template('login.html')
+    return render_template('login.html', google_oauth_enabled=GOOGLE_OAUTH_ENABLED)
+
+
+@app.route("/auth/google")
+def auth_google():
+    """Redirect to Google's OAuth 2.0 consent screen."""
+    if not GOOGLE_OAUTH_ENABLED:
+        flash("Google Sign-In is not configured on this server.", "warning")
+        return redirect(url_for("login"))
+    if current_user.is_authenticated:
+        return redirect(url_for("index"))
+    redirect_uri = url_for("auth_google_callback", _external=True)
+    return _oauth.google.authorize_redirect(redirect_uri)
+
+
+@app.route("/auth/google/callback")
+def auth_google_callback():
+    """Handle the OAuth 2.0 callback from Google."""
+    if not GOOGLE_OAUTH_ENABLED:
+        flash("Google Sign-In is not configured on this server.", "warning")
+        return redirect(url_for("login"))
+
+    try:
+        token = _oauth.google.authorize_access_token()
+        user_info = token.get("userinfo") or _oauth.google.userinfo()
+    except Exception as exc:
+        logger.warning("Google OAuth callback error: %s", exc)
+        flash("Google Sign-In failed. Please try again.", "danger")
+        return redirect(url_for("login"))
+
+    google_id = str(user_info["sub"])
+    email = user_info.get("email", "")
+    full_name = user_info.get("name", email.split("@")[0])
+    picture = user_info.get("picture", "")
+
+    from models import User
+
+    # 1. Look up by OAuth provider + ID (most reliable)
+    user = User.query.filter_by(oauth_provider="google", oauth_id=google_id).first()
+
+    # 2. Fall back to matching by email (links existing password accounts)
+    if user is None and email:
+        user = User.query.filter_by(email=email).first()
+        if user:
+            user.oauth_provider = "google"
+            user.oauth_id = google_id
+            if picture:
+                user.profile_picture = picture
+
+    # 3. Auto-create a new account for first-time Google users
+    if user is None:
+        user = User(
+            email=email,
+            full_name=full_name,
+            password_hash=None,
+            oauth_provider="google",
+            oauth_id=google_id,
+            profile_picture=picture,
+            role="farmer",
+            is_active=True,
+        )
+        db.session.add(user)
+
+    user.last_login = datetime.utcnow()
+    db.session.commit()
+
+    login_user(user)
+    logger.info("User %s signed in via Google OAuth.", user.email)
+    flash(f"Welcome, {user.full_name}! You are now signed in.", "success")
+    return redirect(url_for("index"))
 
 
 @app.route("/register", methods=["GET", "POST"])
@@ -2696,20 +3166,20 @@ def register():
         # Validation
         if not full_name or not email or not password:
             flash('All fields are required', 'danger')
-            return render_template('register.html')
+            return render_template('register.html', google_oauth_enabled=GOOGLE_OAUTH_ENABLED)
         
         if password != confirm_password:
             flash('Passwords do not match', 'danger')
-            return render_template('register.html')
+            return render_template('register.html', google_oauth_enabled=GOOGLE_OAUTH_ENABLED)
         
         if len(password) < 8:
             flash('Password must be at least 8 characters', 'danger')
-            return render_template('register.html')
+            return render_template('register.html', google_oauth_enabled=GOOGLE_OAUTH_ENABLED)
         
         from models import User
         if User.query.filter_by(email=email).first():
             flash('Email already registered', 'danger')
-            return render_template('register.html')
+            return render_template('register.html', google_oauth_enabled=GOOGLE_OAUTH_ENABLED)
         
         # Create user
         user = User(
@@ -2725,7 +3195,7 @@ def register():
         flash('Account created successfully! Please login.', 'success')
         return redirect(url_for('login'))
     
-    return render_template('register.html')
+    return render_template('register.html', google_oauth_enabled=GOOGLE_OAUTH_ENABLED)
 
 
 @app.route("/logout")
@@ -3009,8 +3479,8 @@ def generate_report(analysis_id):
     try:
         from services.report_service import ReportGenerator
     except ImportError as e:
-        logger.error(f"Failed to import ReportGenerator: {e}")
-        return jsonify({'error': f'Report service not available: {str(e)}'}), 500
+        logger.error(f"Failed to import ReportGenerator: {e}", exc_info=True)
+        return jsonify({'error': f'Report service not available'}), 500
     
     analysis = AnalysisHistory.query.get(analysis_id)
     if not analysis:
@@ -3044,10 +3514,8 @@ def generate_report(analysis_id):
             download_name=f'analysis_report_{analysis_id}.pdf'
         )
     except Exception as e:
-        logger.error(f"Error generating report: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
-        return jsonify({'error': str(e)}), 500
+        logger.error(f"Error generating report: {e}", exc_info=True)
+        return jsonify({'error': 'An internal server error occurred'}), 500
 
 
 @app.route("/api/generate-summary-report")
@@ -3061,8 +3529,8 @@ def generate_summary_report():
     try:
         from services.report_service import ReportGenerator
     except ImportError as e:
-        logger.error(f"Failed to import ReportGenerator: {e}")
-        return jsonify({'error': f'Report service not available: {str(e)}'}), 500
+        logger.error(f"Failed to import ReportGenerator: {e}", exc_info=True)
+        return jsonify({'error': 'Report service not available'}), 500
     
     # Get date range
     days = request.args.get('days', 30, type=int)
@@ -3097,10 +3565,8 @@ def generate_summary_report():
             download_name=f'summary_report_{datetime.now().strftime("%Y%m%d")}.pdf'
         )
     except Exception as e:
-        logger.error(f"Error generating summary report: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
-        return jsonify({'error': str(e)}), 500
+        logger.error(f"Error generating summary report: {e}", exc_info=True)
+        return jsonify({'error': 'An internal server error occurred'}), 500
 
 
 # --- Disease Database & Symptom Checker ---
@@ -3261,8 +3727,8 @@ def api_weather_forecast():
             'disease_predictions': predictions
         })
     except Exception as e:
-        logger.error(f"Error fetching weather forecast: {e}")
-        return jsonify({'error': str(e)}), 500
+        logger.error(f"Error fetching weather forecast: {e}", exc_info=True)
+        return jsonify({'error': 'An internal server error occurred'}), 500
 
 
 @app.route("/api/disease-prediction/<disease_name>")
@@ -3306,8 +3772,8 @@ def api_disease_prediction(disease_name):
             'recommendations': recommendations
         })
     except Exception as e:
-        logger.error(f"Error getting disease prediction: {e}")
-        return jsonify({'error': str(e)}), 500
+        logger.error(f"Error getting disease prediction: {e}", exc_info=True)
+        return jsonify({'error': 'An internal server error occurred'}), 500
 
 
 @app.route("/api/historical-patterns")
@@ -3345,8 +3811,8 @@ def api_historical_patterns():
             'total_occurrences': len(occurrences_data)
         })
     except Exception as e:
-        logger.error(f"Error analyzing historical patterns: {e}")
-        return jsonify({'error': str(e)}), 500
+        logger.error(f"Error analyzing historical patterns: {e}", exc_info=True)
+        return jsonify({'error': 'An internal server error occurred'}), 500
 
 
 @app.route("/api/report-disease-occurrence", methods=['POST'])
@@ -3403,9 +3869,9 @@ def api_report_disease_occurrence():
             'occurrence_id': occurrence.id
         })
     except Exception as e:
-        logger.error(f"Error reporting disease occurrence: {e}")
+        logger.error(f"Error reporting disease occurrence: {e}", exc_info=True)
         db.session.rollback()
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': 'An internal server error occurred'}), 500
 
 
 
@@ -3441,6 +3907,7 @@ if __name__ == '__main__':
     # Initialize database tables
     with app.app_context():
         db.create_all()
+        ensure_account_lockout_schema()
         logger.info("Database tables created")
 
         # Seed enterprise RBAC (idempotent)
@@ -3452,8 +3919,19 @@ if __name__ == '__main__':
         except Exception as exc:
             logger.warning(f"RBAC seed skipped/failed: {exc}")
 
-
-    ensure_models_loaded()
+    # --- Async model warm-up: start background thread so Flask is immediately responsive ---
+    warmup_thread = threading.Thread(
+        target=_background_model_warmup,
+        name="model-warmup",
+        daemon=True,
+    )
+    warmup_thread.start()
+    logger.info(
+        "[warm-up] Model loading started in background thread '%s'. "
+        "Server will accept requests immediately. "
+        "Poll GET /health for readiness.",
+        warmup_thread.name,
+    )
     
     # Register models in the registry
     try:
@@ -3479,3 +3957,35 @@ if __name__ == '__main__':
     
     is_debug = os.getenv("FLASK_DEBUG", "False").lower() in ("true", "1", "t")
     app.run(debug=is_debug, host="0.0.0.0", port=5000)
+
+# --- RBAC Management APIs ---
+
+@app.route('/api/admin/roles', methods=['GET', 'POST'])
+@login_required
+@require_role('admin')
+def api_admin_roles():
+    from auth.audit_log import log_audit_event
+    if request.method == 'POST':
+        data = request.get_json()
+        role = Role(name=data['name'], slug=data['slug'], description=data.get('description'))
+        db.session.add(role)
+        db.session.commit()
+        log_audit_event("ROLE_CREATED", f"Role {role.slug} created", user_id=current_user.id)
+        return jsonify({"status": "success", "id": role.id})
+    roles = Role.query.filter_by(deleted_at=None).all()
+    return jsonify([{"id": r.id, "name": r.name, "slug": r.slug} for r in roles])
+
+@app.route('/api/admin/permissions', methods=['GET', 'POST'])
+@login_required
+@require_role('admin')
+def api_admin_permissions():
+    from auth.audit_log import log_audit_event
+    if request.method == 'POST':
+        data = request.get_json()
+        perm = Permission(name=data['name'], slug=data['slug'])
+        db.session.add(perm)
+        db.session.commit()
+        log_audit_event("PERMISSION_CREATED", f"Permission {perm.slug} created", user_id=current_user.id)
+        return jsonify({"status": "success", "id": perm.id})
+    perms = Permission.query.all()
+    return jsonify([{"id": p.id, "name": p.name, "slug": p.slug} for p in perms])

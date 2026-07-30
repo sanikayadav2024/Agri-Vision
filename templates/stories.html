@@ -153,40 +153,54 @@
 
     /* ─── Cards Grid ──────────────────────────────────────── */
     .stories-grid {
-        display: grid;
-        grid-template-columns: repeat(3, 1fr);
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 32px;
+    align-items: start;
+    position: relative;
+    z-index: 1;
+    max-width: 1140px;
+    margin: 0 auto;
+    padding: 0 24px;
+}
+
+@media (max-width: 1024px) {
+    .stories-grid { 
+        grid-template-columns: repeat(2, 1fr);
         gap: 28px;
-        position: relative;
-        z-index: 1;
-        max-width: 1140px;
-        margin: 0 auto;
-        padding: 0 24px;
     }
+}
 
-    @media (max-width: 1024px) {
-        .stories-grid { grid-template-columns: repeat(2, 1fr); }
+@media (max-width: 640px) {
+    .stories-grid { 
+        grid-template-columns: 1fr; 
+        padding: 0 16px;
+        gap: 24px;
     }
-
-    @media (max-width: 640px) {
-        .stories-grid { grid-template-columns: 1fr; padding: 0 16px; }
-        .stories-section { padding: 100px 0 60px; }
-    }
+    .stories-section { padding: 100px 0 60px; }
+}
 
     /* ─── Story Card ──────────────────────────────────────── */
     .story-card {
-        position: relative;
-        background: var(--card-bg, rgba(255,255,255,0.85));
-        border: 1px solid var(--card-border, rgba(46,139,87,0.18));
-        border-radius: 18px;
-        padding: 32px 28px 28px;
-        display: flex;
-        flex-direction: column;
-        gap: 16px;
-        transition: transform 0.32s cubic-bezier(0.34,1.56,0.64,1),
-                    box-shadow 0.32s ease,
-                    border-color 0.32s ease;
-        cursor: default;
-        overflow: hidden;
+    position: relative;
+    background: var(--card-bg, rgba(255,255,255,0.85));
+    border: 1px solid var(--card-border, rgba(46,139,87,0.18));
+    border-radius: 18px;
+    padding: 32px 28px 28px;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    min-height: auto;
+    height: auto;
+    transition: transform 0.32s cubic-bezier(0.34,1.56,0.64,1),
+                box-shadow 0.32s ease,
+                border-color 0.32s ease;
+    cursor: default;
+    overflow: visible;
+    opacity: 0;
+    transform: translateY(28px);
+    animation: card-reveal 0.55s cubic-bezier(0.22,1,0.36,1) forwards;
+}
         /* Stagger entrance animation */
         opacity: 0;
         transform: translateY(28px);
@@ -262,6 +276,7 @@
         width: 54px;
         height: 54px;
         border-radius: 50%;
+        flex-shrink: 0;
         background: linear-gradient(
             135deg,
             rgba(46,139,87,0.16) 0%,
@@ -300,11 +315,13 @@
 }
 
     /* ─── Card: Farmer Name & Location ───────────────────── */
-    .story-meta {
-        display: flex;
-        flex-direction: column;
-        gap: 3px;
-    }
+   .story-meta {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    min-height: auto;
+    flex-shrink: 0;
+}
 
     .story-name {
         font-size: 1.18rem;
@@ -397,18 +414,18 @@
     }
 
     /* ─── Card: Testimonial Quote ─────────────────────────── */
-    .story-quote {
-        font-size: 0.91rem;
-        line-height: 1.7;
-        color: #5c5c5c;;
-        font-style: italic;
-        position: relative;
-        padding-left: 18px;
-        margin: 0;
-        transition: color 0.3s ease;
-
-    }
-
+   .story-quote {
+    font-size: 0.91rem;
+    line-height: 1.7;
+    color: #5c5c5c;
+    font-style: italic;
+    position: relative;
+    padding-left: 18px;
+    margin: 12px 0 0 0;
+    min-height: auto;
+    transition: color 0.3s ease;
+    flex-grow: 1;
+}
     /* Left accent bar — mirrors feature-card icon accent */
     .story-quote::before {
         content: '';
@@ -637,6 +654,35 @@
                 "Agri-Vision helped me monitor crop health in real time and improved my farming decisions."
             </p>
         </div>
+
+        
+        <!-- Farmer 7 — Manpreet Singh -->
+        <div class="story-card">
+            <div class="story-avatar">
+                MS
+            </div>
+
+            <div class="story-meta">
+                <span class="story-name">Manpreet Singh</span>
+                <span class="story-location">
+                    <i class="fas fa-map-marker-alt"></i>
+                    Punjab
+                </span>
+            </div>
+
+            <div class="story-yield-badge">
+                <span class="yield-icon"><i class="fas fa-arrow-up"></i></span>
+                <span class="yield-label">Yield:</span>
+                <span class="yield-value">+38%</span>
+            </div>
+
+            <hr class="story-divider">
+
+            <p class="story-quote">
+                "Agri-Vision helped me identify crop stress and disease symptoms much earlier than traditional field inspections."
+            </p>
+        </div>
+
 
     </div>
 </section>

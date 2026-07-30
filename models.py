@@ -66,7 +66,6 @@ class RolePermission(db.Model):
 
     __table_args__ = (
         db.UniqueConstraint("role_id", "permission_id", name="uq_role_permission"),
-        db.Index("ix_role_permissions_permission_id", "permission_id"),
     )
 
 
@@ -82,7 +81,6 @@ class UserRole(db.Model):
 
     __table_args__ = (
         db.UniqueConstraint("user_id", "role_id", name="uq_user_role"),
-        db.Index("ix_user_roles_role_id", "role_id"),
     )
 
 
@@ -94,16 +92,30 @@ class User(UserMixin, db.Model):
 
     id = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     email = db.Column(db.String(255), unique=True, nullable=False, index=True)
-    password_hash = db.Column(db.String(255), nullable=False)
+    password_hash = db.Column(db.String(255), nullable=True)  # Nullable for OAuth-only accounts
     full_name = db.Column(db.String(255), nullable=False)
     role = db.Column(db.String(20), default=ROLE_FARMER)  # farmer, researcher, admin
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     last_login = db.Column(db.DateTime, nullable=True)
     is_active = db.Column(db.Boolean, default=True)
+    failed_login_attempts = db.Column(db.Integer, default=0, nullable=False)
+    last_failed_login_at = db.Column(db.DateTime, nullable=True)
+    account_locked_until = db.Column(db.DateTime, nullable=True, index=True)
+    last_successful_login_at = db.Column(db.DateTime, nullable=True)
+    last_failed_ip = db.Column(db.String(64), nullable=True)
+    last_successful_ip = db.Column(db.String(64), nullable=True)
+
+    # OAuth fields (populated when user signs in via Google)
+    oauth_provider = db.Column(db.String(32), nullable=True)   # e.g. "google"
+    oauth_id = db.Column(db.String(255), nullable=True, index=True)  # Provider's unique user ID
+    profile_picture = db.Column(db.String(500), nullable=True)  # Profile photo URL from provider
 
     # Relationships
     analyses = db.relationship(
         "AnalysisHistory", backref="user", lazy=True, cascade="all, delete-orphan"
+    )
+    user_roles = db.relationship(
+        "UserRole", backref="user", lazy="dynamic", cascade="all, delete-orphan"
     )
 
     def set_password(self, password):
@@ -113,8 +125,10 @@ class User(UserMixin, db.Model):
         self.password_hash = hashpw(password.encode("utf-8"), gensalt()).decode("utf-8")
 
     def check_password(self, password):
-        """Check if password matches hash"""
-        from bcrypt import checkpw, hashpw
+        """Check if password matches hash. Returns False for OAuth-only accounts."""
+        if not self.password_hash:
+            return False
+        from bcrypt import checkpw
 
         return checkpw(password.encode("utf-8"), self.password_hash.encode("utf-8"))
 
@@ -153,6 +167,12 @@ class User(UserMixin, db.Model):
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "last_login": self.last_login.isoformat() if self.last_login else None,
             "is_active": self.is_active,
+            "failed_login_attempts": self.failed_login_attempts,
+            "account_locked_until": (
+                self.account_locked_until.isoformat()
+                if self.account_locked_until
+                else None
+            ),
         }
 
 
